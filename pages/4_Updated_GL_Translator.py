@@ -43,6 +43,7 @@ def read_messy_file(uploaded_file, required_columns):
         df.rename(columns={col_idx: col_name}, inplace=True)
     df = df.iloc[last_row+1:].reset_index(drop=True)
     df.columns = [normalize(c) for c in df.columns]
+    # Drop rows where the first required column (account) is null — removes totals/blank rows
     df.dropna(subset=[required_columns[0]], how='any', inplace=True)
     return df
 
@@ -65,17 +66,23 @@ def clean_account(val):
     return s
 
 def merge_gl(df_gl, df_map, amount_cols):
+    # -- identical to your original, amount_cols replaces hardcoded 'balance' --
     df_gl['maestro_account']  = df_gl['maestro_account'].apply(clean_account)
     df_map['maestro_account'] = df_map['maestro_account'].apply(clean_account)
 
+    # Drop blank/nan maestro accounts from mapping (Sage-only rows)
     df_map = df_map[df_map['maestro_account'].str.lower() != 'nan']
     df_map = df_map[df_map['maestro_account'] != '']
-    df_gl  = df_gl[df_gl['maestro_account'].str.lower() != 'nan']
-    df_gl  = df_gl[df_gl['maestro_account'] != '']
 
+    # Drop blank/nan account rows from GL (includes totals row which has no account number)
+    df_gl = df_gl[df_gl['maestro_account'].str.lower() != 'nan']
+    df_gl = df_gl[df_gl['maestro_account'] != '']
+
+    # Step 1: detect one-to-many
     one_to_many  = df_map.groupby('maestro_account').filter(lambda x: len(x) > 1)
     split_mapping = {}
 
+    # Step 2: collect split % inputs
     if not one_to_many.empty:
         st.info("One-to-many mapping detected. Enter split percentages:")
         for acct in one_to_many['maestro_account'].unique():
@@ -93,16 +100,19 @@ def merge_gl(df_gl, df_map, amount_cols):
                 st.warning(f"Splits for {acct} do not sum to 100%. They will be normalized automatically.")
             split_mapping[acct] = [p * 100 / sum(splits) for p in splits]
 
+    # Step 3: separate GL rows into split and non-split accounts
     split_accounts  = list(split_mapping.keys())
     df_gl_normal    = df_gl[~df_gl['maestro_account'].isin(split_accounts)]
     df_gl_split     = df_gl[df_gl['maestro_account'].isin(split_accounts)]
 
+    # Left join for normal (one-to-one) accounts only
     df_map_normal   = df_map[~df_map['maestro_account'].isin(split_accounts)].drop_duplicates(subset=['maestro_account'])
     df_merged       = df_gl_normal.merge(
         df_map_normal[['maestro_account', 'sage_account', 'sage_account_name']],
         on='maestro_account', how='left'
     )
 
+    # Step 4: handle split accounts separately — one output row per sage mapping
     if split_mapping:
         final_rows = []
         for _, gl_row in df_gl_split.iterrows():
@@ -117,11 +127,18 @@ def merge_gl(df_gl, df_map, amount_cols):
                 final_rows.append(new_row)
         df_split_result = pd.DataFrame(final_rows)
         df_merged = pd.concat([df_merged, df_split_result], ignore_index=True)
+        # Sort by original GL order
         df_merged = df_merged.sort_values('maestro_account').reset_index(drop=True)
 
     df_merged = df_merged[['maestro_account', 'sage_account', 'sage_account_name', 'description'] + amount_cols]
 
-    totals = {col: pd.to_numeric(df_merged[col], errors='coerce').sum() for col in amount_cols}
+    # Round to 2 decimal places and replace 0 with None (blank)
+    for col in amount_cols:
+        df_merged[col] = pd.to_numeric(df_merged[col], errors='coerce').round(2)
+        df_merged[col] = df_merged[col].apply(lambda x: None if x == 0 else x)
+
+    # Totals — sum from final merged output (splits always sum to 100% so total is preserved)
+    totals = {col: round(pd.to_numeric(df_merged[col], errors='coerce').sum(), 2) for col in amount_cols}
     totals_row = {'maestro_account': None, 'sage_account': None, 'sage_account_name': None, 'description': 'TOTAL'}
     totals_row.update(totals)
     df_merged = pd.concat([df_merged, pd.DataFrame([totals_row])], ignore_index=True)
@@ -135,6 +152,7 @@ mapping_file = st.file_uploader("Upload Maestro GL File", type=['xlsx'])
 
 if mapping_file and gl_file:
     try:
+        # Read mapping file
         df_map = read_messy_file(mapping_file, REQUIRED_MAP_COLUMNS)
         df_map.rename(columns={
             'maestro_account_no': 'maestro_account',
@@ -143,46 +161,77 @@ if mapping_file and gl_file:
             'acct_name':          'sage_account_name'
         }, inplace=True)
 
+        # Detect mode and read GL file
         mode = detect_gl_mode(gl_file)
 
         if mode == 'balance':
             df_gl = read_messy_file(gl_file, REQUIRED_GL_COLUMNS_BALANCE)
             df_gl.rename(columns={'account': 'maestro_account', 'current balance': 'balance'}, inplace=True)
             df_gl['balance'] = pd.to_numeric(df_gl['balance'], errors='coerce').fillna(0)
+
             df_final = merge_gl(df_gl, df_map, amount_cols=['balance'])
+
             st.success("GL Mapping Completed Successfully!")
             st.dataframe(df_final)
+
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                 df_final.to_excel(writer, index=False, sheet_name='GL_Translated')
             buffer.seek(0)
-            st.download_button("Download Translated GL File", data=buffer, file_name="translated_gl.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button(
+                "Download Translated GL File",
+                data=buffer,
+                file_name="translated_gl.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
         elif mode == 'dr_cr':
             df_gl = read_messy_file(gl_file, REQUIRED_GL_COLUMNS_DR_CR)
             df_gl.rename(columns={'account': 'maestro_account'}, inplace=True)
             df_gl['debit']  = pd.to_numeric(df_gl['debit'],  errors='coerce').fillna(0)
             df_gl['credit'] = pd.to_numeric(df_gl['credit'], errors='coerce').fillna(0)
+
             df_final = merge_gl(df_gl, df_map, amount_cols=['debit', 'credit'])
+
             st.success("GL Mapping Completed Successfully!")
+
             tab1, tab2 = st.tabs(["Balance View", "Debit / Credit View"])
             with tab1:
+                # Balance View: one row per maestro account with original full balance (debit - credit)
+                # Use df_gl (pre-split) so split accounts appear once with their full amount
                 df_balance_view = df_gl.copy()
                 df_balance_view['balance'] = df_balance_view['debit'] - df_balance_view['credit']
+                # Join sage account info — for split accounts just take the first sage mapping
                 df_map_first = df_map.drop_duplicates(subset=['maestro_account'], keep='first')
-                df_balance_view = df_balance_view.merge(df_map_first[['maestro_account', 'sage_account', 'sage_account_name']], on='maestro_account', how='left')
+                df_balance_view = df_balance_view.merge(
+                    df_map_first[['maestro_account', 'sage_account', 'sage_account_name']],
+                    on='maestro_account', how='left'
+                )
                 df_balance_view = df_balance_view[['maestro_account', 'sage_account', 'sage_account_name', 'description', 'balance']]
-                bal_total = pd.to_numeric(df_balance_view['balance'], errors='coerce').sum()
-                df_balance_view = pd.concat([df_balance_view, pd.DataFrame([{'maestro_account': None, 'sage_account': None, 'sage_account_name': None, 'description': 'TOTAL', 'balance': bal_total}])], ignore_index=True)
+                # Round to 2 decimal places and replace 0 with blank
+                df_balance_view['balance'] = pd.to_numeric(df_balance_view['balance'], errors='coerce').round(2)
+                df_balance_view['balance'] = df_balance_view['balance'].apply(lambda x: None if x == 0 else x)
+                # Append totals row
+                bal_total = round(pd.to_numeric(df_balance_view['balance'], errors='coerce').sum(), 2)
+                df_balance_view = pd.concat([df_balance_view, pd.DataFrame([{
+                    'maestro_account': None, 'sage_account': None,
+                    'sage_account_name': None, 'description': 'TOTAL', 'balance': bal_total
+                }])], ignore_index=True)
                 st.dataframe(df_balance_view)
             with tab2:
                 st.dataframe(df_final)
+
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                 df_balance_view.to_excel(writer, index=False, sheet_name='GL_Balance')
                 df_final.to_excel(writer, index=False, sheet_name='GL_Debit_Credit')
             buffer.seek(0)
-            st.download_button("Download Translated GL File (Both Sheets)", data=buffer, file_name="translated_gl.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button(
+                "Download Translated GL File (Both Sheets)",
+                data=buffer,
+                file_name="translated_gl.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
         else:
             st.error("Could not detect GL columns. File must contain either 'Current Balance' OR both 'Debit' and 'Credit' columns.")
