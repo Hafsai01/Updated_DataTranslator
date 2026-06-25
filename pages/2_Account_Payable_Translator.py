@@ -2,13 +2,15 @@ import io
 import pandas as pd
 import streamlit as st
 
-REQUIRED_COLUMNS = ['code', 'invoice#', 'invoice date', 'due date','retainage','sub-total','total due']
+REQUIRED_COLUMNS = ['code', 'invoice#', 'invoice date', 'due date', 'retainage', 'sub-total', 'total due']
+
 
 def normalize(s):
     try:
         return str(s).strip().lower()
     except:
         return ''
+
 
 def find_header_positions(df, required_columns, max_rows=50):
     """
@@ -29,6 +31,7 @@ def find_header_positions(df, required_columns, max_rows=50):
         raise ValueError(f"Maestro file is missing required columns: {missing}")
     return mapping, i  # i = last header row
 
+
 def read_maestro_file(uploaded_file):
     """
     Reads Maestro file, detects scattered headers, keeps all columns.
@@ -47,13 +50,13 @@ def read_maestro_file(uploaded_file):
         full_df.rename(columns={col_idx: col_name.title()}, inplace=True)
 
     # Drop rows above last header row
-    df = full_df.iloc[last_header_row+1:].reset_index(drop=True)
+    df = full_df.iloc[last_header_row + 1:].reset_index(drop=True)
 
     # Drop rows where all required columns are blank
     df.dropna(subset=[col.title() for col in REQUIRED_COLUMNS], how='all', inplace=True)
 
-
     return df
+
 
 def merge_vendor_ids(df_maestro, df_mapping):
     """
@@ -72,6 +75,7 @@ def merge_vendor_ids(df_maestro, df_mapping):
 
     return df_merged
 
+
 # ----------------- Streamlit UI -----------------
 st.title("AP Data Translator")
 
@@ -85,16 +89,27 @@ if maestro_file and mapping_file:
 
         # Merge to get VENDOR_ID
         df_translated = merge_vendor_ids(df_maestro, df_mapping)
-        
-        #Rename columns for output only
-        df_translated.rename(columns={
-            'Code': 'Maestro_ID',  # rename Code to Maestro_ID
-        }, inplace=True)
 
-        # Define final columns for output
-        final_cols = ['Intact_Vendor_ID', 'Maestro_ID'] + [col.title() for col in REQUIRED_COLUMNS if col.lower() != 'code']
-        # Keep only the desired columns
-        #final_cols = ['VENDOR_ID'] + [col.title() for col in REQUIRED_COLUMNS]
+        # Strip datetime to date-only (YYYY-MM-DD) for Invoice Date and Due Date
+        for date_col in ['Invoice Date', 'Due Date']:
+            if date_col in df_translated.columns:
+                df_translated[date_col] = pd.to_datetime(
+                    df_translated[date_col], errors='coerce'
+                ).dt.strftime('%Y-%m-%d')
+
+        # Add Retainage Percent = Retainage / Total Due
+        retainage = pd.to_numeric(df_translated['Retainage'], errors='coerce')
+        total_due = pd.to_numeric(df_translated['Total Due'], errors='coerce')
+        df_translated['Retainage Percent'] = (retainage / total_due).where(
+            total_due != 0
+        ).map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+
+        # Define final columns — Maestro_ID removed
+        final_cols = (
+            ['Intact_Vendor_ID']
+            + [col.title() for col in REQUIRED_COLUMNS if col.lower() != 'code']
+            + ['Retainage Percent']
+        )
         df_translated = df_translated[final_cols]
 
         st.success("Files processed successfully!")
