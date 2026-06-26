@@ -102,7 +102,7 @@ if maestro_file and mapping_file:
         grand_total = pd.to_numeric(df_translated['Grand Total'], errors='coerce')
         df_translated['Retainage Percent'] = (retainage / grand_total).where(
             grand_total != 0
-        ).map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+        ).map(lambda x: f"{x*100:.2f}" if pd.notna(x) else "")
 
         # Define final columns — Maestro_Id removed
         final_cols = (
